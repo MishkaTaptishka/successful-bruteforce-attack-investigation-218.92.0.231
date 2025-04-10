@@ -1,0 +1,122 @@
+// investigate logon events initiated from a specific suspicious remote IP
+// identify all authentication attempts originating from 218.92.0.231 within the past 30 days
+// review 'ActionType' field to determine whether logon attempts were successful or failed
+let remote_device_ip = "218.92.0.231";
+DeviceLogonEvents
+| where TimeGenerated > ago(30d)
+| where RemoteIP has remote_device_ip
+| where ActionType == "LogonSuccess"
+// output: total_device_logon_events.csv
+
+// investigate suspicious process execution on affected devices
+// identify potential malicious or automated activity post-logon, tied to the suspicious IP
+// filter DeviceProcessEvents for known data transfer and scripting tools
+// limit to devices where a logon from RemoteIP 218.92.0.231 was observed
+// review command-line arguments and parent process relationships
+// review SHA256 values
+let remote_device_ip = "218.92.0.231";
+DeviceProcessEvents
+| where TimeGenerated > ago(30d)
+| where InitiatingProcessCommandLine has_any ("Invoke-WebRequest", "wget", "curl", "certutil", "powershell", ".ps1")
+| where DeviceName in (
+    DeviceLogonEvents
+    | where TimeGenerated > ago(30d)
+    | where RemoteIP == remote_device_ip
+    | where ActionType == "LogonSuccess"
+    | summarize by DeviceName
+)
+//| where SHA256 == "6ddf688bdf16a1d465aef954ff90b372dacd8162bac2c7797ff7b6b4f20afcbc" // PRESENT - trojan.xorddos/ddos
+//| where SHA256 == "2f70458e2b77fba49697e3fbba8bea53e27e7ca010fd92ca3919b819d3aee160" // ABSENT - trojan.xorddos/ddos
+| project TimeGenerated, DeviceName, FileName, SHA256, FolderPath, InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessParentFileName, ProcessCommandLine, InitiatingProcessSHA256
+// output: total_device_process_events.csv
+
+// examine file system activity on impacted devices
+// determine if suspicious file creation, modification, or staging took place post-compromise
+// query DeviceFileEvents for any file activity on hosts previously seen communicating with 218.92.0.231
+// DeviceName limited to those where RemoteIP 218.92.0.231 had login attempts (successful or failed)
+// review file names, paths, SHA256 values, and command-line context that initiated the activity
+let remote_device_ip = "218.92.0.231";
+DeviceFileEvents
+| where TimeGenerated > ago(15d)
+| where DeviceName in (
+    DeviceLogonEvents
+    | where TimeGenerated > ago(15d)
+    | where RemoteIP == remote_device_ip
+    | where ActionType == "LogonSuccess"
+    | summarize by DeviceName
+)
+| project TimeGenerated, DeviceName, FileName, SHA256, FolderPath, InitiatingProcessFileName, InitiatingProcessSHA256, InitiatingProcessFolderPath, InitiatingProcessParentFileName, InitiatingProcessCommandLine
+// output: total_device_file_events.csv
+
+// correlate file and network events on devices associated with RemoteIP 218.92.0.231
+// detect data staging or exfiltration behavior linked to a known malicious IP
+// extract relevant file events from potentially compromised devices
+let remote_device_ip = "218.92.0.231";
+let file_events =
+    DeviceFileEvents
+    | where TimeGenerated > ago(10d)
+    // Limit to devices that had logon activity from the flagged RemoteIP
+    | where DeviceName in (
+        DeviceLogonEvents
+        | where TimeGenerated > ago(10d)
+        | where RemoteIP == remote_device_ip
+        | where ActionType == "LogonSuccess"
+        | summarize by DeviceName
+    )
+    | project file_time = TimeGenerated, DeviceName, FileName, SHA256, FolderPath, FileAction = ActionType;
+// extract network events from those same devices
+let network_events =
+    DeviceNetworkEvents
+    | where TimeGenerated > ago(10d)
+    | where ActionType == "ConnectionSuccess"
+    | where DeviceName in (
+        file_events
+        | summarize by DeviceName
+    )
+    | project net_time = TimeGenerated, DeviceName, LocalIP, RemoteIP, RemotePort, InitiatingProcessFileName, InitiatingProcessSHA256, InitiatingProcessCommandLine;
+// correlate file and network activity within a 2-minute window
+file_events
+| join kind=inner (
+    network_events
+) on DeviceName
+| where abs(datetime_diff("minute", file_time, net_time)) <= 2
+| project file_time, net_time, DeviceName, FileName, SHA256, FileAction, FolderPath, RemoteIP, RemotePort, InitiatingProcessFileName, InitiatingProcessSHA256, InitiatingProcessCommandLine
+| order by file_time desc
+// output: total_file_events_and_network_events.csv
+
+// correlate file and network events on devices associated with RemoteIP 218.92.0.231
+// detect data staging or exfiltration behavior linked to a known malicious IP
+// extract relevant file events from potentially compromised devices
+let remote_device_ip = "218.92.0.231";
+let file_events =
+    DeviceFileEvents
+    | where TimeGenerated > ago(10d)
+    // Limit to devices that had logon activity from the flagged RemoteIP
+    | where DeviceName in (
+        DeviceLogonEvents
+        | where TimeGenerated > ago(10d)
+        | where RemoteIP == remote_device_ip
+        | where ActionType == "LogonSuccess"
+        | summarize by DeviceName
+    )
+    | project file_time = TimeGenerated, DeviceName, FileName, SHA256, FolderPath, FileAction = ActionType;
+// extract network events from those same devices
+let network_events =
+    DeviceNetworkEvents
+    | where TimeGenerated > ago(10d)
+    | where ActionType == "ConnectionSuccess"
+    | where DeviceName in (
+        file_events
+        | summarize by DeviceName
+    )
+    | project net_time = TimeGenerated, DeviceName, LocalIP, RemoteIP, RemotePort, InitiatingProcessFileName, InitiatingProcessSHA256, InitiatingProcessCommandLine;
+// correlate file and network activity within a 2-minute window
+file_events
+| join kind=inner (
+    network_events
+) on DeviceName
+| where abs(datetime_diff("minute", file_time, net_time)) <= 2
+| project file_time, net_time, DeviceName, FileName, SHA256, FileAction, FolderPath, RemoteIP, RemotePort, InitiatingProcessFileName, InitiatingProcessSHA256, InitiatingProcessCommandLine
+| order by file_time desc
+| summarize suspicious_IPs = count() by RemoteIP
+// output: total_suspicious_ips.csv
